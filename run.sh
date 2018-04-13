@@ -23,6 +23,22 @@ exiterr()  { echo "Error: $1" >&2; exit 1; }
 nospaces() { printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
 noquotes() { printf '%s' "$1" | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"; }
 
+check_str() {
+  if [ -z "$1" ]; then
+    exiterr "VPN $2 must be specified. Edit your config and re-enter it."
+  fi
+
+  if printf '%s' "$1" | LC_ALL=C grep -q '[^ -~]\+'; then
+    exiterr "VPN $2 must not contain non-ASCII characters."
+  fi
+
+  case "$1" in
+    *[\\\"\']*)
+      exiterr "VPN $2 must not contain these special characters: \\ \" '"
+      ;;
+  esac
+}
+
 check_ip() {
   IP_REGEX='^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$'
   printf '%s' "$1" | tr -d '\n' | grep -Eq "$IP_REGEX"
@@ -44,48 +60,53 @@ EOF
 fi
 ip link delete dummy0 >/dev/null 2>&1
 
+VPN_IPSEC_PSK="$(cat credentials/ipsec_psk)"
+
 mkdir -p /opt/src
 vpn_env="/opt/src/vpn-gen.env"
-if [ -z "$VPN_IPSEC_PSK" ] && [ -z "$VPN_USER" ] && [ -z "$VPN_PASSWORD" ]; then
+if [ -z "$VPN_IPSEC_PSK" ]; then
   if [ -f "$vpn_env" ]; then
     echo
     echo "Retrieving previously generated VPN credentials..."
     . "$vpn_env"
   else
     echo
-    echo "VPN credentials not set by user. Generating random PSK and password..."
+    echo "VPN PSK not set by user. Generating random PSK..."
     VPN_IPSEC_PSK="$(LC_CTYPE=C tr -dc 'A-HJ-NPR-Za-km-z2-9' < /dev/urandom | head -c 16)"
-    VPN_USER=vpnuser
-    VPN_PASSWORD="$(LC_CTYPE=C tr -dc 'A-HJ-NPR-Za-km-z2-9' < /dev/urandom | head -c 16)"
 
     echo "VPN_IPSEC_PSK=$VPN_IPSEC_PSK" > "$vpn_env"
-    echo "VPN_USER=$VPN_USER" >> "$vpn_env"
-    echo "VPN_PASSWORD=$VPN_PASSWORD" >> "$vpn_env"
     chmod 600 "$vpn_env"
   fi
+fi
+
+vpn_users="/opt/src/vpn-users.env"
+
+if [ ! -f "$vpn_users" ]; then
+  while IFS=':' read -r name passwd; do
+    if [ -z "$passwd" ]; then
+      VPN_PASSWORD="$(LC_CTYPE=C tr -dc 'A-HJ-NPR-Za-km-z2-9' < /dev/urandom | head -c 16)"
+    else
+      VPN_PASSWORD="$passwd"
+    fi
+
+    VPN_USER="$(nospaces "$name")"
+    VPN_USER="$(noquotes "$VPN_USER")"
+    VPN_PASSWORD="$(nospaces "$VPN_PASSWORD")"
+    VPN_PASSWORD="$(noquotes "$VPN_PASSWORD")"
+
+    check_str "$VPN_USER" "username"
+    check_str "$VPN_PASSWORD" "password"
+
+    cat >> "$vpn_users" <<EOF
+$VPN_USER $VPN_PASSWORD
+EOF
+  done < credentials/users
 fi
 
 # Remove whitespace and quotes around VPN variables, if any
 VPN_IPSEC_PSK="$(nospaces "$VPN_IPSEC_PSK")"
 VPN_IPSEC_PSK="$(noquotes "$VPN_IPSEC_PSK")"
-VPN_USER="$(nospaces "$VPN_USER")"
-VPN_USER="$(noquotes "$VPN_USER")"
-VPN_PASSWORD="$(nospaces "$VPN_PASSWORD")"
-VPN_PASSWORD="$(noquotes "$VPN_PASSWORD")"
-
-if [ -z "$VPN_IPSEC_PSK" ] || [ -z "$VPN_USER" ] || [ -z "$VPN_PASSWORD" ]; then
-  exiterr "All VPN credentials must be specified. Edit your 'env' file and re-enter them."
-fi
-
-if printf '%s' "$VPN_IPSEC_PSK $VPN_USER $VPN_PASSWORD" | LC_ALL=C grep -q '[^ -~]\+'; then
-  exiterr "VPN credentials must not contain non-ASCII characters."
-fi
-
-case "$VPN_IPSEC_PSK $VPN_USER $VPN_PASSWORD" in
-  *[\\\"\']*)
-    exiterr "VPN credentials must not contain these special characters: \\ \" '"
-    ;;
-esac
+check_str "$VPN_IPSEC_PSK" "PSK"
 
 echo
 echo 'Trying to auto discover IP of this server...'
@@ -199,14 +220,19 @@ connect-delay 5000
 EOF
 
 # Create VPN credentials
-cat > /etc/ppp/chap-secrets <<EOF
-"$VPN_USER" l2tpd "$VPN_PASSWORD" *
+
+while read -r name passwd; do
+  # cat <<EOF
+  cat >> /etc/ppp/chap-secrets <<EOF
+"$name" l2tpd "$passwd" *
 EOF
 
-VPN_PASSWORD_ENC=$(openssl passwd -1 "$VPN_PASSWORD")
-cat > /etc/ipsec.d/passwd <<EOF
-$VPN_USER:$VPN_PASSWORD_ENC:xauth-psk
+  VPN_PASSWORD_ENC=$(openssl passwd -1 "$passwd")
+  # cat <<EOF
+  cat > /etc/ipsec.d/passwd <<EOF
+$name:$VPN_PASSWORD_ENC:xauth-psk
 EOF
+done < "$vpn_users"
 
 # Update sysctl settings
 SYST='/sbin/sysctl -e -q -w'
@@ -266,8 +292,9 @@ Connect to your new VPN with these details:
 
 Server IP: $PUBLIC_IP
 IPsec PSK: $VPN_IPSEC_PSK
-Username: $VPN_USER
-Password: $VPN_PASSWORD
+
+Users:
+$(cat $vpn_users)
 
 Write these down. You'll need them to connect!
 
